@@ -60,6 +60,7 @@ Run inside a cloned repo to omit the repository argument.
 | `-d, --claim-days <n>` | Ignore claim comments older than n days (default 30) |
 | `-a, --all` | Also show taken issues and why |
 | `--json` | Output JSON (free issues only, or all with `--all`) |
+| `--no-color` | Disable colored output. Colors are also off when `NO_COLOR` is set or output isn't a terminal. |
 
 ## How it works
 
