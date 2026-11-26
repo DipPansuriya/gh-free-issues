@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# gh free-issues: find open issues nobody is already working on.
+set -euo pipefail
+
+VERSION="0.1.0"
+
+usage() {
+  cat <<'EOF'
+Find open issues that are actually free to work on.
+
+Usage:
+  gh free-issues <owner/repo> [flags]
+
+An issue is considered taken if it has an assignee, an open pull request
+that references it, or a recent comment claiming it ("can I work on this?").
+
+Flags:
+  -l, --label <name>      Only issues with this label (repeatable)
+  -L, --limit <n>         Number of issues to inspect, max 100 (default 50)
+  -d, --claim-days <n>    Ignore claim comments older than n days (default 30)
+  -a, --all               Also show taken issues and why
+      --json              Output JSON
+  -h, --help              Show help
+  -v, --version           Show version
+
+Examples:
+  gh free-issues typescript-eslint/typescript-eslint -l "accepting prs"
+  gh free-issues vitejs/vite -l "good first issue" --all
+EOF
+}
+
+repo=""
+labels=()
+limit=50
+claim_days=30
+show_all=false
+json=false
+
+need_value() {
+  if [ $# -lt 2 ] || [ -z "$2" ]; then
+    echo "Error: $1 requires a value" >&2
+    exit 1
+  fi
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -l|--label) need_value "$@"; labels+=("$2"); shift 2 ;;
+    -L|--limit) need_value "$@"; limit="$2"; shift 2 ;;
+    -d|--claim-days) need_value "$@"; claim_days="$2"; shift 2 ;;
+    -a|--all) show_all=true; shift ;;
+    --json) json=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -v|--version) echo "gh-free-issues $VERSION"; exit 0 ;;
+    -*) echo "Unknown flag: $1" >&2; usage >&2; exit 1 ;;
+    *) repo="$1"; shift ;;
+  esac
+done
+
+if [ -z "$repo" ]; then
+  repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
+fi
+if [ -z "$repo" ]; then
+  echo "Error: specify a repository, e.g. gh free-issues owner/repo" >&2
+  exit 1
+fi
+case "$limit" in ''|*[!0-9]*) echo "Error: --limit must be a number" >&2; exit 1 ;; esac
+case "$claim_days" in ''|*[!0-9]*) echo "Error: --claim-days must be a number" >&2; exit 1 ;; esac
+[ "$limit" -gt 100 ] && limit=100
+
+search="repo:$repo is:issue is:open sort:created-desc"
+for l in ${labels[@]+"${labels[@]}"}; do
+  search="$search label:\"$l\""
+done
+
+read -r -d '' QUERY <<'EOF' || true
+query($q: String!, $n: Int!) {
+  search(query: $q, type: ISSUE, first: $n) {
+    nodes {
+      ... on Issue {
+        number
+        title
+        url
+        createdAt
+        assignees(first: 5) { nodes { login } }
+        comments(last: 30) { totalCount nodes { author { login } body createdAt } }
+        timelineItems(last: 50, itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT]) {
+          nodes {
+            __typename
+            ... on CrossReferencedEvent { source { ... on PullRequest { number state repository { nameWithOwner } } } }
+            ... on ConnectedEvent { subject { ... on PullRequest { number state repository { nameWithOwner } } } }
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+
+# Comments like "can I work on this?" or "I'll take this" mean someone has claimed the issue.
+CLAIM_RE='(can|could|may) i (please )?(work on|take|pick( up)?|grab|try|have a go)|i(.d| would) (like|love) to (work on|take|tackle|pick)|i(.ll| will|.m going to) (work on|take|pick|tackle|give it a)|assign (it|this|me)|working on (this|it)|i.m on it|i.ve (started|begun) (working|on)'
+
+FILTER='
+  def prs: [ .timelineItems.nodes[] | (.source // .subject)
+    | select(. != null and .number != null and (.repository.nameWithOwner | ascii_downcase) == ($repo | ascii_downcase)) ];
+  def recent_claims($cutoff):
+    [ .comments.nodes[]
+      | select(.createdAt >= $cutoff)
+      | select(.body | test($re; "i"))
+      | .author.login // "ghost" ];
+  [ .data.search.nodes[] | select(.number != null)
+    | (prs) as $prs
+    | {
+        number, title, url,
+        created: .createdAt[:10],
+        comments: .comments.totalCount,
+        assignees: [ .assignees.nodes[].login ],
+        openPRs: [ $prs[] | select(.state == "OPEN") | .number ] | unique,
+        closedPRs: [ $prs[] | select(.state != "OPEN") | .number ] | unique,
+        claimedBy: (recent_claims($cutoff) | unique)
+      }
+    | .free = ((.assignees | length) == 0 and (.openPRs | length) == 0 and (.claimedBy | length) == 0)
+    | .reasons = (
+        [ (if (.assignees | length) > 0 then "assigned to " + (.assignees | join(", ")) else empty end),
+          (if (.openPRs | length) > 0 then "open PR " + (.openPRs | map("#" + tostring) | join(", ")) else empty end),
+          (if (.claimedBy | length) > 0 then "claimed by " + (.claimedBy | join(", ")) else empty end) ]
+      )
+  ]
+'
+
+if date -v-1d +%F >/dev/null 2>&1; then
+  cutoff="$(date -u -v-"${claim_days}"d +%Y-%m-%dT%H:%M:%SZ)"
+else
+  cutoff="$(date -u -d "${claim_days} days ago" +%Y-%m-%dT%H:%M:%SZ)"
+fi
+
+# gh's --jq has no --arg, so inline the values as JSON string literals.
+json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/'; }
+prelude="$(json_str "$CLAIM_RE") as \$re | $(json_str "$repo") as \$repo | $(json_str "$cutoff") as \$cutoff | "
+
+run_query() {
+  gh api graphql -f query="$QUERY" -f q="$search" -F n="$limit" --jq "$prelude$FILTER | $1"
+}
+
+if $json; then
+  if $show_all; then run_query '.'; else run_query 'map(select(.free))'; fi
+  exit 0
+fi
+
+if [ -t 1 ]; then
+  green=$'\033[32m'; red=$'\033[31m'; dim=$'\033[2m'; bold=$'\033[1m'; reset=$'\033[0m'
+else
+  green=""; red=""; dim=""; bold=""; reset=""
+fi
+
+free_count=0
+taken_count=0
+free_out=""
+taken_out=""
+while IFS=$'\x1f' read -r free number title created comments closed reasons url; do
+  [ -z "$number" ] && continue
+  if [ "$free" = "true" ]; then
+    free_count=$((free_count + 1))
+    note="${comments} comments, opened ${created}"
+    [ -n "$closed" ] && note="$note, earlier closed PR ${closed}"
+    free_out+="${green}#${number}${reset}  ${bold}${title}${reset}"$'\n'"       ${dim}${note} · ${url}${reset}"$'\n'
+  else
+    taken_count=$((taken_count + 1))
+    taken_out+="${red}#${number}${reset}  ${title}"$'\n'"       ${dim}${reasons}${reset}"$'\n'
+  fi
+done < <(run_query '.[] | [ (.free | tostring), (.number | tostring), .title, .created,
+  (.comments | tostring), (.closedPRs | map("#" + tostring) | join(", ")),
+  (.reasons | join("; ")), .url ] | join("\u001f")')
+
+printf '%sFree issues in %s%s (%d of %d checked)\n\n' "$bold" "$repo" "$reset" "$free_count" "$((free_count + taken_count))"
+if [ "$free_count" -eq 0 ]; then
+  echo "  None found. Try --all to see why, or a different label."
+else
+  printf '%s' "$free_out"
+fi
+
+if $show_all && [ "$taken_count" -gt 0 ]; then
+  printf '\n%sTaken%s (%d)\n\n' "$bold" "$reset" "$taken_count"
+  printf '%s' "$taken_out"
+fi
